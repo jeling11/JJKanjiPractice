@@ -3,3 +3,5 @@ streamlit-drawable-canvas
 numpy
 scipy
 matplotlib
+requests
+svgpathtools
