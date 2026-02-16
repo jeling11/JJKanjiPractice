@@ -1,186 +1,190 @@
 import streamlit as st
 import numpy as np
-import matplotlib.pyplot as plt
 import requests
 import xml.etree.ElementTree as ET
 from svgpathtools import parse_path
 from streamlit_drawable_canvas import st_canvas
+from scipy.spatial.distance import cdist
 
 # --- 1. CONFIGURATION ---
 
 KANJI_VG_SIZE = 109 
 CANVAS_SIZE = 400
+SNAP_THRESHOLD = 30  # How lenient the snapping is (Higher = easier)
 
 # --- 2. KANJIVG INTEGRATION ---
 
-def fetch_kanji_strokes(char: str):
-    """Fetches SVG data from KanjiVG and returns stroke coordinates."""
-    if not char:
-        return []
-        
+@st.cache_data
+def fetch_kanji_data(char: str):
+    """Fetches reference strokes and raw SVG paths."""
+    if not char: return [], []
     code = f"{ord(char):05x}"
     url = f"https://raw.githubusercontent.com/KanjiVG/kanjivg/master/kanji/{code}.svg"
-    
     try:
-        response = requests.get(url)
-        if response.status_code != 200:
-            st.error(f"Could not find data for '{char}'.")
-            return []
-            
-        root = ET.fromstring(response.content)
-        strokes = []
+        r = requests.get(url)
+        if r.status_code != 200: return [], []
+        
+        root = ET.fromstring(r.content)
+        strokes_resampled = []
+        strokes_svg_str = [] # We keep the raw SVG string for rendering the "perfect" line
         
         for path_elem in root.iter():
             if path_elem.tag.endswith('path'):
-                d_str = path_elem.get('d')
-                if d_str:
-                    path_obj = parse_path(d_str)
-                    points = []
-                    # Sample 20 points per stroke
-                    for i in range(21):
-                        complex_pt = path_obj.point(i / 20.0)
-                        points.append((complex_pt.real, complex_pt.imag))
-                    strokes.append(np.array(points))
-        return strokes
-    except Exception as e:
-        st.error(f"Error parsing data: {e}")
-        return []
+                d = path_elem.get('d')
+                strokes_svg_str.append(d)
+                # Mathematical resampling for grading
+                p_obj = parse_path(d)
+                pts = [(p_obj.point(i/20).real, p_obj.point(i/20).imag) for i in range(21)]
+                strokes_resampled.append(np.array(pts))
+        return strokes_resampled, strokes_svg_str
+    except:
+        return [], []
 
-# --- 3. HELPER FUNCTIONS ---
+# --- 3. MATH & CONVERSION ---
 
 def resample_path(path_arr, num_points=20):
-    if len(path_arr) < 2:
-        return np.array([path_arr[0]] * num_points)
-    
+    if len(path_arr) < 2: return np.array([path_arr[0]]*num_points)
     dists = np.sqrt(np.sum(np.diff(path_arr, axis=0)**2, axis=1))
     cum_dists = np.insert(np.cumsum(dists), 0, 0)
-    total_len = cum_dists[-1]
-    
-    if total_len == 0:
-        return np.array([path_arr[0]] * num_points)
+    if cum_dists[-1] == 0: return np.array([path_arr[0]]*num_points)
+    new_dists = np.linspace(0, cum_dists[-1], num_points)
+    return np.column_stack((np.interp(new_dists, cum_dists, path_arr[:,0]), 
+                            np.interp(new_dists, cum_dists, path_arr[:,1])))
 
-    new_dists = np.linspace(0, total_len, num_points)
-    new_x = np.interp(new_dists, cum_dists, path_arr[:, 0])
-    new_y = np.interp(new_dists, cum_dists, path_arr[:, 1])
-    
-    return np.column_stack((new_x, new_y))
+def svg_to_fabric_json(svg_path_str, color="black"):
+    """
+    Converts a raw SVG path string into a Fabric.js object dict 
+    so st_canvas can render the 'snapped' stroke.
+    """
+    scale = CANVAS_SIZE / KANJI_VG_SIZE
+    return {
+        "type": "path",
+        "originX": "left", "originY": "top",
+        "left": 0, "top": 0,
+        "fill": None,
+        "stroke": color,
+        "strokeWidth": 4,
+        "path": parse_path(svg_path_str).d(), # Ensures clean string
+        "scaleX": scale,
+        "scaleY": scale,
+        "selectable": False # User cannot move the snapped lines
+    }
 
-def extract_user_strokes(canvas_result):
-    if not canvas_result.json_data:
-        return []
+def extract_last_stroke(canvas_result):
+    """Gets the most recent stroke drawn by the user."""
+    if not canvas_result.json_data: return None
+    objs = canvas_result.json_data["objects"]
+    if not objs: return None
     
-    objects = canvas_result.json_data["objects"]
-    user_strokes = []
-    scale_factor = KANJI_VG_SIZE / CANVAS_SIZE
+    # Get last object
+    last_obj = objs[-1]
+    path_cmds = last_obj.get("path", [])
+    points = []
+    for cmd in path_cmds:
+        if len(cmd) >= 3: points.append((cmd[-2], cmd[-1]))
     
-    for obj in objects:
-        if obj["type"] == "path":
-            raw_path = obj["path"]
-            points = []
-            for cmd in raw_path:
-                if len(cmd) >= 3:
-                    points.append((cmd[-2], cmd[-1]))
-            
-            if points:
-                norm_points = []
-                for x, y in points:
-                    norm_points.append((x * scale_factor, y * scale_factor))
-                user_strokes.append(np.array(norm_points))
-    return user_strokes
+    if not points: return None
+    
+    # Normalize to 109 scale
+    scale = KANJI_VG_SIZE / CANVAS_SIZE
+    return np.array([(x*scale, y*scale) for x,y in points])
 
-def grade_submission(user_strokes, ref_strokes):
-    if len(user_strokes) != len(ref_strokes):
-        return 0, f"Incorrect stroke count. Expected {len(ref_strokes)}, got {len(user_strokes)}.", None
-
-    total_error = 0
-    fig, ax = plt.subplots(figsize=(4, 4))
-    ax.set_xlim(0, KANJI_VG_SIZE)
-    ax.set_ylim(KANJI_VG_SIZE, 0) 
-    ax.axis('off')
-    
-    for i, (u_raw, r_pts) in enumerate(zip(user_strokes, ref_strokes)):
-        u_pts = resample_path(u_raw)
-        dist = np.mean(np.linalg.norm(u_pts - r_pts, axis=1))
-        total_error += dist
-        
-        # Plot Reference (Green Dotted)
-        ax.plot(r_pts[:,0], r_pts[:,1], 'g--', linewidth=3, alpha=0.5, label="Correct" if i==0 else "")
-        # Plot User
-        color = 'black' if dist < 12 else 'red'
-        ax.plot(u_pts[:,0], u_pts[:,1], color=color, linewidth=3, label="You" if i==0 else "")
-
-    avg_error = total_error / len(ref_strokes)
-    score = max(0, 100 - (avg_error * 5))
-    
-    feedback = "Perfect!"
-    if score < 85: feedback = "Good, but watch the details."
-    if score < 50: feedback = "Try again. Follow the green guides."
-    
-    return int(score), feedback, fig
-
-# --- 4. MAIN APP UI ---
+# --- 4. MAIN APP ---
 
 def main():
-    st.set_page_config(page_title="Kanji Memory Test", layout="centered")
+    st.title("⚡ Magic Kanji Snapping")
+    st.caption("Draw the stroke. If it's correct, it will 'snap' to the perfect shape.")
+
+    # A. Session State Setup
+    if "step" not in st.session_state: st.session_state.step = 0
+    if "locked_objects" not in st.session_state: st.session_state.locked_objects = []
+    if "canvas_key" not in st.session_state: st.session_state.canvas_key = 0
+
+    # B. Input
+    char = st.text_input("Kanji", value="木", max_chars=1)
+    ref_strokes, ref_svgs = fetch_kanji_data(char)
+
+    if not ref_strokes:
+        st.error("Kanji not found.")
+        return
+
+    # C. Logic: Did user just draw a stroke?
+    # We use a placeholder to render canvas, then check logic below it
+    canvas_container = st.empty()
     
-    st.title("🧠 Kanji Memory Test")
-    st.caption("Select a word and write it from memory.")
+    # Prepare the initial drawing (The strokes we have already snapped)
+    initial_drawing = {
+        "version": "4.4.0",
+        "objects": st.session_state.locked_objects
+    }
 
-    # Input Selection
-    col_sel, col_inp = st.columns([1, 1])
-    with col_sel:
-        practice_list = ["一", "二", "三", "川", "口", "木", "人", "永"]
-        target_char = st.selectbox("Select Target to Practice:", practice_list)
-    with col_inp:
-        custom = st.text_input("Or type custom Kanji:", max_chars=1)
-        if custom: target_char = custom
+    with canvas_container:
+        canvas_result = st_canvas(
+            fill_color="rgba(0,0,0,0)",
+            stroke_width=5,
+            stroke_color="black",
+            background_color="#fff",
+            initial_drawing=initial_drawing,
+            update_streamlit=True,
+            height=CANVAS_SIZE, 
+            width=CANVAS_SIZE,
+            drawing_mode="freedraw",
+            # We increment key to force a re-render when we snap a line
+            key=f"canvas_{st.session_state.canvas_key}" 
+        )
 
-    # Fetch Data
-    if 'current_kanji' not in st.session_state or st.session_state.current_kanji != target_char:
-        st.session_state.current_kanji = target_char
-        with st.spinner(f"Loading data..."):
-            st.session_state.ref_strokes = fetch_kanji_strokes(target_char)
-
-    ref_strokes = st.session_state.ref_strokes
-
-    # --- CANVAS SECTION (Target Display Removed) ---
-    st.markdown("### Write below:")
-    
-    # Canvas is now centered and the main focus
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 165, 0, 0.3)",
-        stroke_width=6,
-        stroke_color="#000000",
-        background_color="#ffffff",
-        height=CANVAS_SIZE,
-        width=CANVAS_SIZE,
-        drawing_mode="freedraw",
-        key="canvas",
-    )
-
-    if st.button("Grade My Memory", type="primary"):
-        if canvas_result.json_data:
-            user_strokes = extract_user_strokes(canvas_result)
+    # D. Grading Logic
+    if canvas_result.json_data:
+        objects = canvas_result.json_data["objects"]
+        
+        # If there are more objects on screen than we have locked, the user just drew one
+        if len(objects) > len(st.session_state.locked_objects):
             
-            if not user_strokes:
-                st.warning("Canvas is empty.")
-            elif not ref_strokes:
-                st.error("Invalid Kanji selected.")
-            else:
-                score, comment, fig = grade_submission(user_strokes, ref_strokes)
+            # 1. Get the user's new stroke
+            user_stroke_raw = extract_last_stroke(canvas_result)
+            
+            if user_stroke_raw is not None and st.session_state.step < len(ref_strokes):
                 
-                st.divider()
-                st.subheader("Results")
+                # 2. Compare against the CURRENT target stroke
+                current_target_idx = st.session_state.step
+                target_stroke = ref_strokes[current_target_idx]
                 
-                r_col1, r_col2 = st.columns([1, 2])
-                with r_col1:
-                    st.metric("Score", f"{score}/100")
-                    if score > 80: st.balloons()
-                with r_col2:
-                    st.write(f"**Feedback:** {comment}")
-                    if fig:
-                        st.pyplot(fig)
-                        st.caption("Green = Correct Shape | Red = Your Error")
+                # Math: Resample and Distance
+                u_res = resample_path(user_stroke_raw)
+                dist = np.mean(np.linalg.norm(u_res - target_stroke, axis=1))
+                
+                # 3. Decision
+                if dist < SNAP_THRESHOLD:
+                    # SUCCESS: Snap to grid
+                    st.toast(f"Stroke {current_target_idx + 1} Snapped! ✅")
+                    
+                    # Convert the Perfect Reference Stroke to Fabric JSON
+                    perfect_stroke_json = svg_to_fabric_json(ref_svgs[current_target_idx], color="#00aa00")
+                    
+                    # Add to locked list
+                    st.session_state.locked_objects.append(perfect_stroke_json)
+                    st.session_state.step += 1
+                    
+                    # Force canvas reload to remove user's messy line and show the clean one
+                    st.session_state.canvas_key += 1
+                    st.rerun()
+                    
+                else:
+                    # FAILURE: Wrong shape
+                    st.toast(f"Too messy! Try stroke {current_target_idx + 1} again. ❌")
+                    # Ideally, we undo their last stroke here.
+                    # In this simple version, we just let them hit undo on the toolbar or ignore it.
+
+    # E. Progress Display
+    st.progress(st.session_state.step / len(ref_strokes))
+    if st.session_state.step == len(ref_strokes):
+        st.balloons()
+        st.success("Kanji Complete!")
+        if st.button("Reset"):
+            st.session_state.step = 0
+            st.session_state.locked_objects = []
+            st.session_state.canvas_key += 1
+            st.rerun()
 
 if __name__ == "__main__":
     main()
